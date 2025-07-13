@@ -1,0 +1,81 @@
+---
+- name: Cleanup unused NX-OS images from Nexus switches
+  hosts: nexus
+  gather_facts: no
+  connection: network_cli
+
+  vars:
+    bootflash_extensions: ['bin', 'pkg', 'tar']
+
+  tasks:
+
+    - name: Get current boot configuration
+      cisco.nxos.nxos_command:
+        commands:
+          - show boot
+      register: boot_output
+
+    - name: Extract active image filename
+      set_fact:
+        active_image: >-
+          {{ boot_output.stdout[0] | regex_search('boot nxos bootflash:(\\S+)', '\\1') | default('', true) }}
+
+    - name: Ensure active image was parsed successfully
+      assert:
+        that:
+          - active_image != ''
+        fail_msg: "❌ Could not determine the active NX-OS image from 'show boot'. Aborting cleanup."
+        success_msg: "✅ Active image successfully identified: {{ active_image }}"
+
+    - name: List all files in bootflash
+      cisco.nxos.nxos_command:
+        commands:
+          - dir bootflash:
+      register: dir_output
+
+    - name: Parse bootflash file list for image files
+      set_fact:
+        bootflash_files: >-
+          {{
+            dir_output.stdout[0].split('\n')
+            | select('match', '^\\s*\\d+\\s+\\S+\\s+\\d+\\s+(\\S+)')
+            | map('regex_replace', '^\\s*\\d+\\s+\\S+\\s+\\d+\\s+', '')
+            | select('match', '\\.(' + bootflash_extensions | join('|') + ')$')
+            | list
+          }}
+
+    - name: Identify unused images
+      set_fact:
+        unused_images: >-
+          {{ bootflash_files | difference([active_image]) }}
+
+    - name: Display parsed image info
+      debug:
+        msg: |
+          ✅ Active image: {{ active_image }}
+          🗑️ Unused images to delete: {{ unused_images | default([]) }}
+
+    - name: Ensure no overlap between unused and active image
+      assert:
+        that:
+          - active_image not in unused_images
+        fail_msg: "❌ Safety check failed. Active image is included in unused_images. Aborting!"
+        success_msg: "✅ Safety check passed. Active image is not in unused list."
+
+    - name: Confirm unused image deletion
+      pause:
+        prompt: |
+          ⚠️ You are about to delete the following images on {{ inventory_hostname }}:
+          {{ unused_images }}
+          Are you sure? Press Enter to continue or Ctrl+C to cancel.
+      when: unused_images | length > 0
+
+    - name: Delete unused images from bootflash
+      cisco.nxos.nxos_command:
+        commands: "{{ unused_images | map('regex_replace', '^', 'delete bootflash:') | list }}"
+        confirm: yes
+      when: unused_images | length > 0
+
+    - name: Save running config
+      cisco.nxos.nxos_config:
+        save_when: always
